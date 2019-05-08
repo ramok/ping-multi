@@ -3,6 +3,7 @@ use strict;
 use warnings;
 
 use Net::Ping;
+use Data::Dumper;
 
 use threads;
 use threads::shared;
@@ -12,18 +13,24 @@ Getopt::Long::Configure qw(gnu_getopt);
 
 use Curses;
 use JSON::PP;
-use Time::HiRes qw(sleep usleep time);
+use Time::HiRes qw(sleep usleep time tv_interval);
 use POSIX;
 use Statistics::Descriptive;
 use File::Basename;
 
 my $timeout = 1;
 my $ping_interval = 1;
+my $hostdown_min_lost_ping = 3;
 my %ping_data : shared = ();
 my %resolved_hosts : shared = ();
 my $sync_ping_cnt : shared = 0;
 my @pressed_keys = ();
 my @thr_handles = (); # used in the SIG handlers
+my $term_resize = 0;
+my @log_data : shared = ();
+my $log_subwin;
+my $log_scrolled = 0;
+my $log_scroll_shift = 0;
 my $scr_max = {
 	'x' => undef,
 	'y' => undef,
@@ -34,6 +41,7 @@ my $hdr_len = {
 	'rtt' => '6',
 	'history' => undef,
 };
+my $hdr_line_cnt = 3;
 my @stats_selector = qw/ Last Loss% Avg Min Max StDev RX_cnt TX_cnt XX_cnt /;
 my $host_meta = {};
 my $host_meta_cnt = 0;
@@ -43,6 +51,7 @@ my %config : shared = (
 	'scale_ms' => undef,
 	'pause' => 0,
 	'sync_ping' => 0,
+	'log_size' => 500,
 );
 
 sub ping_host {
@@ -138,9 +147,23 @@ sub init_curses() {
 	start_color();
 	curs_set(0);
 	halfdelay(1); # makes getch() to block with a timeout
+	keypad(1);
+
+	reinit_curses();
+}
+
+sub reinit_curses() {
+	endwin();
+	refresh();
 
 	$scr_max->{'y'} =  getmaxy(stdscr);
 	$scr_max->{'x'} =  getmaxx(stdscr);
+
+	$log_subwin->delwin() if (defined $log_subwin);
+	$log_subwin = subwin(0, 0, $host_meta_cnt + $hdr_line_cnt + 1, 0);
+	$log_subwin->scrollok(1);
+	$log_subwin->clearok(1);
+	$log_subwin->leaveok(1);
 }
 
 sub handle_pressed_keys() {
@@ -167,6 +190,44 @@ sub handle_pressed_keys() {
 			exit_curses_and_join_threads();
 			exit(0);
 		}
+		if ($key eq KEY_PPAGE) {
+			my $y = $log_subwin->getmaxy;
+			lock(@log_data);
+
+			my $log_len = scalar @log_data;
+			$log_scroll_shift += $y;
+			if($log_scroll_shift > $log_len - $y) {
+				$log_scroll_shift = $log_len - $y;
+			}
+
+			if ($log_len > $y) {
+				$log_subwin->scrl($y);
+				$log_scrolled = 1;
+			}
+			print_log_header ("scrolled: $log_scrolled, y: $y, log_len:".scalar @log_data." , shift: $log_scroll_shift");
+		}
+		if ($key eq KEY_NPAGE) {
+			my $y = $log_subwin->getmaxy;
+			lock(@log_data);
+
+			my $log_len = scalar @log_data;
+
+			$log_scroll_shift -= $y;
+			if($log_scroll_shift < 0) {
+				$log_scroll_shift = 0;
+				$log_scrolled = 0;
+			} else {
+				$log_scrolled = 1;
+				$log_subwin->scrl(-$y);
+			}
+			print_log_header ("scrolled: $log_scrolled, y: $y, log_len:".scalar @log_data." , shift: $log_scroll_shift");
+		}
+		if ($key eq KEY_RESIZE) {
+			$term_resize = 1;
+		}
+		if ($key eq "\n" || $key eq ' ') {
+			print_log("--- seen ---\n");
+		}
 	}
 }
 
@@ -178,10 +239,12 @@ sub init_structs_for_host {
 	}
 
 	$host_meta->{$line} = {
-		'line_pos' => $host_meta_cnt + 3,
+		'line_pos' => $host_meta_cnt + $hdr_line_cnt,
 		'stats' => Statistics::Descriptive::Full->new(),
 		'pkt_sent' => 0,
 		'pkt_recv' => 0,
+		'down_timestamp' => 0,
+		'down_cnt' => 0,
 	};
 	++$host_meta_cnt;
 
@@ -260,6 +323,7 @@ sub calc_hdr_lengths {
 		$hdr_len->{'sep'};
 	
 	if ($hdr_len->{'history'} < 10) {
+		#TODO: set history to 1 and say it to log
 		die("Your screen is too small (columns=".$scr_max->{'x'}.").\n");
 	}
 }
@@ -443,24 +507,85 @@ sub print_ping_data {
 
 			# update the global data
 			$ping_data{$host} = encode_json(\@all_samples);
+
+			my $last_sample = $all_samples[-1];
+			if (!$last_sample->{'success'}) {
+				$host_meta->{$host}->{'down_cnt'}++;
+
+				if ($host_meta->{$host}->{'down_cnt'} == $hostdown_min_lost_ping) {
+					print_log($host." host down\n");
+				}
+
+				if ($host_meta->{$host}->{'down_timestamp'} eq 0) {
+					$host_meta->{$host}->{'down_timestamp'} = time;
+				}
+			} else {
+				if ($host_meta->{$host}->{'down_timestamp'} ne 0 && $host_meta->{$host}->{'down_cnt'} >= $hostdown_min_lost_ping) {
+					print_log($host." host recover. Down time: ".
+						sec2human(floor(time - $host_meta->{$host}->{'down_timestamp'})). "\n");
+				}
+				$host_meta->{$host}->{'down_timestamp'} = 0;
+				$host_meta->{$host}->{'down_cnt'} = 0;
+			}
 		}
 	}
 }
 
 sub trigger_sync_ping {
-    if (!$config{'sync_ping'}) {
-        return;
-    }
+	return if (!$config{'sync_ping'});
 
-    lock($sync_ping_cnt);
-    lock(%ping_data);
+	lock($sync_ping_cnt);
+	lock(%ping_data);
 
-    if ($sync_ping_cnt < keys %ping_data) {
-        return ;
-    }
+	return if ($sync_ping_cnt < keys %ping_data);
 
-    $sync_ping_cnt = 0;
-    cond_broadcast($sync_ping_cnt);
+	$sync_ping_cnt = 0;
+	cond_broadcast($sync_ping_cnt);
+}
+
+sub sec2human {
+	my $in_sec = shift @_;
+	my @out;
+	my $mday; my $hour;my $min; my $sec;
+
+	return "$in_sec sec." if ($in_sec <= 60);
+
+	push @out, "$mday day"  if (($mday = int($in_sec/(24 * 60 * 60))) != 0);
+	push @out, "$hour hour" if (($hour = ($in_sec / (60 * 60) % 24))  != 0);
+	push @out, "$min min"   if (($min  = ($in_sec / 60) % 60)	  != 0);
+	push @out, "$sec sec"   if (($sec  =  $in_sec % 60)		  != 0);
+
+	return "$in_sec sec (" . join(' ', @out) . ")";
+}
+
+sub print_log_header {
+	# my $x, $y;
+	# $log_subwin->getxy($x, $y);
+	$_ = shift;
+	chomp;
+	addstr(stdscr, $host_meta_cnt + $hdr_line_cnt, 0, "=== " . $_ ." ===");
+}
+
+sub print_log {
+	my $line = strftime("%d-%m-%Y %H:%M:%S", localtime(time))."   ".shift @_;
+	lock(@log_data);
+
+	shift @log_data if (scalar(@log_data) > $config{'log_size'});
+
+	push @log_data, $line;
+
+	return if ($log_scrolled);
+
+	$log_subwin->addstr($line);
+	$log_subwin->refresh;
+}
+
+sub refresh_log {
+	lock(@log_data);
+	foreach my $line (@log_data) {
+		$log_subwin->addstr($line);
+	}
+	$log_subwin->refresh;
 }
 
 sub print_main_headers() {
@@ -519,6 +644,15 @@ sub usage() {
 	);
 }
 
+sub term_resize_handle {
+	return unless ($term_resize);
+	$term_resize = 0;
+
+	reinit_curses();
+	calc_hdr_lengths();
+	refresh_log();
+}
+
 sub main() {
 	my $file = '';
 	my $help;
@@ -556,6 +690,8 @@ sub main() {
 	while(1) {
 		getch_blocking(); # with a very short timeout
 		handle_pressed_keys();
+
+		term_resize_handle();
 
 		print_main_headers();
 		print_host_headers();
