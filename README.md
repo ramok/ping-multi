@@ -1,10 +1,12 @@
 # ping-multi
-Interactively ping one or multiple hosts.
+Interactively ping one or multiple hosts from a single location.
 
 Screenshot 1:
+
 ![Ping-multi Screenshot 1](demo/screenshot-1.jpg?raw=true)
 
 Screenshot 2:
+
 ![Ping-multi Screenshot 2](demo/screenshot-2.jpg?raw=true)
 
 # Motivation
@@ -31,6 +33,8 @@ The results are displayed in an interactive curses text console which features t
 
 You can select the statistics forwards and backwards using the lower "s" and upper "S" keys, similar to the "Vim" behavior.
 
+The host status changes can be logged to a file. This allows you to review the time of each event.
+
 # Installation
 
 The program depends on the following additional Perl modules:
@@ -56,9 +60,37 @@ Ping multiple hosts specified in a file; you can also add more single hosts dire
 sudo ./ping-multi -f sample.list
 ```
 
+Ping and log up/down events to a file:
+```bash
+sudo ./ping-multi -l events.log google.com github.com
+```
+
 Ping hosts synchronously; [this comment](https://github.com/famzah/ping-multi/pull/2#issuecomment-339098285) explains when this ping method is useful:
 ```bash
 sudo ./ping-multi -S 192.168.0.1 192.168.0.2 192.168.0.15
 ```
 
+# Required privileges
+
 Making ICMP ping requests requires "root" privileges on Linux.
+
+Alternatively, you can and you should get advantage of the Linux [capabilities](https://man7.org/linux/man-pages/man7/capabilities.7.html) and execute "ping-multi" with an unprivileged user who only has the CAP_NET_RAW capability. In such a case you need to define the environment variable `PING_MULTI_NO_ROOT_CHECK`, because the Perl module Net::Ping doesn't detect Linux capabilities. Here is a quick example, but do you own research on how to assign capabilities to a process:
+```bash
+sudo setpriv --reuid nobody --regid nogroup --init-groups \
+	--inh-caps -all,+net_raw --ambient-caps -all,+net_raw \
+	env PING_MULTI_NO_ROOT_CHECK=1 \
+	./ping-multi google.com github.com
+```
+
+# Docker
+
+You can also use Docker to run ping-multi:
+```bash
+docker run --rm -it chrislwade/ping-multi
+docker run --rm -it chrislwade/ping-multi google.com github.com
+docker run --rm -it chrislwade/ping-multi -f sample.list
+docker run --rm -it chrislwade/ping-multi -l events.log google.com github.com
+docker run --rm -it chrislwade/ping-multi -S 192.168.0.1 192.168.0.2 192.168.0.15
+```
+
+The Docker image is maintainted by [@chrislwade](https://github.com/chrislwade).

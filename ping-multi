@@ -41,10 +41,9 @@ my $hdr_len = {
 	'rtt' => '6',
 	'history' => undef,
 };
-my $hdr_line_cnt = 3;
 my @stats_selector = qw/ Last Loss% Avg Min Max StDev RX_cnt TX_cnt XX_cnt /;
+my @sort_selector = ('None', 'Asc', 'Desc');
 my $host_meta = {};
-my $host_meta_cnt = 0;
 my %config : shared = (
 	'print_resolved_ip' => 0,
 	'show_scale' => 0,
@@ -53,6 +52,8 @@ my %config : shared = (
 	'sync_ping' => 0,
 	'log_size' => 500,
 );
+my $hosts_print_line_offset = 3; # const
+my $logfile = "";
 
 sub ping_host {
 	my $host = shift;
@@ -160,10 +161,21 @@ sub reinit_curses() {
 	$scr_max->{'x'} =  getmaxx(stdscr);
 
 	$log_subwin->delwin() if (defined $log_subwin);
-	$log_subwin = subwin(0, 0, $host_meta_cnt + $hdr_line_cnt + 1, 0);
+	$log_subwin = subwin(0, 0, (scalar keys %{$host_meta}) + $hosts_print_line_offset + 1, 0);
 	$log_subwin->scrollok(1);
 	$log_subwin->clearok(1);
 	$log_subwin->leaveok(1);
+}
+
+sub make_last_element_first {
+	my $arr = shift @_;
+	my $reverse = shift @_;
+
+	if (!$reverse) {
+		push(@{$arr}, shift @{$arr});
+	} else {
+		unshift(@{$arr}, pop @{$arr});
+	}
 }
 
 sub handle_pressed_keys() {
@@ -175,10 +187,16 @@ sub handle_pressed_keys() {
 			$config{'print_resolved_ip'} = !$config{'print_resolved_ip'};
 		}
 		if ($key eq 's') {
-			push(@stats_selector, shift @stats_selector);
+			make_last_element_first(\@stats_selector, 0);
 		}
 		if ($key eq 'S') {
-			unshift(@stats_selector, pop @stats_selector);
+			make_last_element_first(\@stats_selector, 1);
+		}
+		if ($key eq 'o') {
+			make_last_element_first(\@sort_selector, 0);
+		}
+		if ($key eq 'O') {
+			make_last_element_first(\@sort_selector, 1);
 		}
 		if (lc($key) eq 't') {
 			$config{'show_scale'} = !$config{'show_scale'};
@@ -233,20 +251,22 @@ sub handle_pressed_keys() {
 
 sub init_structs_for_host {
 	my $line = shift @_;
+	my $pos = (scalar keys %{$host_meta}) + $hosts_print_line_offset;
 
 	if (exists($host_meta->{$line})) {
 		return;
 	}
 
 	$host_meta->{$line} = {
-		'line_pos' => $host_meta_cnt + $hdr_line_cnt,
+		'line_pos' => (scalar keys %{$host_meta}) + $hosts_print_line_offset,
 		'stats' => Statistics::Descriptive::Full->new(),
 		'pkt_sent' => 0,
 		'pkt_recv' => 0,
+		'init_line_pos' => $pos,
+		'previous' => -1,
 		'down_timestamp' => 0,
 		'down_cnt' => 0,
 	};
-	++$host_meta_cnt;
 
 	$ping_data{$line} = encode_json([]);
 }
@@ -364,6 +384,14 @@ sub _print_ping_sample_scale {
 	return $num;
 }
 
+sub print_logfile {
+	my $now = shift @_;
+	my $host = shift @_;
+	my $status = shift @_;
+
+	print LOGFILE "$now $host $status\n" or die("print($logfile): $!");
+}
+
 sub _print_ping_samples {
 	my $host = shift @_;
 	my @all_samples = @{shift @_};
@@ -371,6 +399,12 @@ sub _print_ping_samples {
 	my $i;
 	my $ch;
 	my $sample;
+	my $now;
+
+	if ($logfile ne "") {
+		my ($second, $minute, $hour, $day, $month, $year) = (localtime(time))[0..5];
+		$now = sprintf ("%d-%02d-%02d %02d:%02d:%02d", $year + 1900, $month + 1, $day, $hour, $minute, $second);
+	}
 
 	$pos = $scr_max->{'x'} - $hdr_len->{'history'};
 	for ($i = 0; $i < $hdr_len->{'history'}; ++$i, ++$pos) {
@@ -384,9 +418,29 @@ sub _print_ping_samples {
 			if ($sample->{'stats_new'}) {
 				$sample->{'stats_new'} = 0;
 				$host_meta->{$host}->{'pkt_sent'} += 1;
+				if ($host_meta->{$host}->{'previous'} < 0) {
+					$host_meta->{$host}->{'previous'} = $sample->{'success'};
+					if ($logfile ne "") {
+						if ($sample->{'success'}) {
+							print_logfile($now, $host, "STARTSUP");
+						} else {
+							print_logfile($now, $host, "STARTSDOWN");
+						}
+					}
+				}
 				if ($sample->{'success'}) {
 					$host_meta->{$host}->{'stats'}->add_data($sample->{'rtt'});
 					$host_meta->{$host}->{'pkt_recv'} += 1;
+				}
+				if ($host_meta->{$host}->{'previous'} ne $sample->{'success'}) {
+					$host_meta->{$host}->{'previous'} = $sample->{'success'};
+					if ($logfile ne "") {
+						if ($sample->{'success'}) {
+							print_logfile($now, $host, "UP");
+						} else {
+							print_logfile($now, $host, "DOWN");
+						}
+					}
 				}
 			}
 
@@ -404,7 +458,7 @@ sub _print_ping_samples {
 sub _get_rtt_sample_stats {
 	my $sample = shift @_;
 	my $host = shift @_;
-	my $val;
+	my ($val, $raw_val);
 	my $st = $stats_selector[0];
 	my $decpt = 1;
 	my $suffix = '';
@@ -459,19 +513,22 @@ sub _get_rtt_sample_stats {
 		die("Bad stats_selector value: $st");
 	}
 
+	$raw_val = $val;
 	if (!defined($val)) {
 		$val = '-';
 	} else {
 		$val = sprintf('%.'.$decpt.'f', $val);
 	}
-	return sprintf('%'.$hdr_len->{'rtt'}.'s', $val . $suffix);
+	return (sprintf('%'.$hdr_len->{'rtt'}.'s', $val . $suffix), $raw_val, $suffix);
 }
 
-sub _print_ping_rtt_info {
+sub get_ping_rtt_info {
 	my $host = shift @_;
 	my @all_samples = @{shift @_};
 	my $sample;
 	my $ch;
+	my $val = undef;
+	my $suffix = undef;
 
 	$ch = sprintf(
 		'%'.$hdr_len->{'rtt'}.'s',
@@ -479,8 +536,19 @@ sub _print_ping_rtt_info {
 	);
 	if (scalar @all_samples > 0) {
 		$sample = $all_samples[scalar @all_samples - 1]; # last sample
-		$ch = _get_rtt_sample_stats($sample, $host);
+		($ch, $val, $suffix) = _get_rtt_sample_stats($sample, $host);
 	}
+
+	return ($ch, $val, $suffix);
+}
+
+sub _print_ping_rtt_info {
+	my $host = shift @_;
+	my $all_samples_ref = shift @_;
+	my $ch;
+
+	($ch, undef, undef) = get_ping_rtt_info($host, $all_samples_ref);
+
 	addstr(
 		$host_meta->{$host}->{'line_pos'},
 		$hdr_len->{'host'} + $hdr_len->{'sep'},
@@ -492,41 +560,38 @@ sub print_ping_data {
 	my $host;
 	my @all_samples;
 
-	{
-		lock(%ping_data);
-		foreach $host (keys %ping_data) {
-			@all_samples = @{decode_json($ping_data{$host})};
+	foreach $host (keys %ping_data) {
+		@all_samples = @{decode_json($ping_data{$host})};
 
-			if (scalar @all_samples > $hdr_len->{'history'}) {
-				# cut into half; save only the more recent entries
-				@all_samples = splice @all_samples, scalar(@all_samples)/2;
+		if (scalar @all_samples > $hdr_len->{'history'}) {
+			# cut into half; save only the more recent entries
+			@all_samples = splice @all_samples, scalar(@all_samples)/2;
+		}
+
+		_print_ping_samples($host, \@all_samples);
+		_print_ping_rtt_info($host, \@all_samples);
+
+		# update the global data
+		$ping_data{$host} = encode_json(\@all_samples);
+
+		my $last_sample = $all_samples[-1];
+		if (!$last_sample->{'success'}) {
+			$host_meta->{$host}->{'down_cnt'}++;
+
+			if ($host_meta->{$host}->{'down_cnt'} == $hostdown_min_lost_ping) {
+				print_log($host." host down\n");
 			}
 
-			_print_ping_samples($host, \@all_samples);
-			_print_ping_rtt_info($host, \@all_samples);
-
-			# update the global data
-			$ping_data{$host} = encode_json(\@all_samples);
-
-			my $last_sample = $all_samples[-1];
-			if (!$last_sample->{'success'}) {
-				$host_meta->{$host}->{'down_cnt'}++;
-
-				if ($host_meta->{$host}->{'down_cnt'} == $hostdown_min_lost_ping) {
-					print_log($host." host down\n");
-				}
-
-				if ($host_meta->{$host}->{'down_timestamp'} eq 0) {
-					$host_meta->{$host}->{'down_timestamp'} = time;
-				}
-			} else {
-				if ($host_meta->{$host}->{'down_timestamp'} ne 0 && $host_meta->{$host}->{'down_cnt'} >= $hostdown_min_lost_ping) {
-					print_log($host." host recover. Down time: ".
-						sec2human(floor(time - $host_meta->{$host}->{'down_timestamp'})). "\n");
-				}
-				$host_meta->{$host}->{'down_timestamp'} = 0;
-				$host_meta->{$host}->{'down_cnt'} = 0;
+			if ($host_meta->{$host}->{'down_timestamp'} eq 0) {
+				$host_meta->{$host}->{'down_timestamp'} = time;
 			}
+		} else {
+			if ($host_meta->{$host}->{'down_timestamp'} ne 0 && $host_meta->{$host}->{'down_cnt'} >= $hostdown_min_lost_ping) {
+				print_log($host." host recover. Down time: ".
+					sec2human(floor(time - $host_meta->{$host}->{'down_timestamp'})). "\n");
+			}
+			$host_meta->{$host}->{'down_timestamp'} = 0;
+			$host_meta->{$host}->{'down_cnt'} = 0;
 		}
 	}
 }
@@ -563,7 +628,7 @@ sub print_log_header {
 	# $log_subwin->getxy($x, $y);
 	$_ = shift;
 	chomp;
-	addstr(stdscr, $host_meta_cnt + $hdr_line_cnt, 0, "=== " . $_ ." ===");
+	addstr(stdscr, (scalar keys %{$host_meta}) + $hosts_print_line_offset, 0, "=== " . $_ ." ===");
 }
 
 sub print_log {
@@ -595,34 +660,52 @@ sub print_main_headers() {
 	my $s;
 	my $item;
 	my $pos;
+	my $arrow;
+	my $stats_title;
+	my $arrow_placeholder = "\1";
 
 	$fmt = '%-'.$hdr_len->{'host'}.'s%'.$hdr_len->{'sep'}.'s%'.
 		$hdr_len->{'rtt'}.'s%'.$hdr_len->{'sep'}.'s%-'.
 		$hdr_len->{'history'}.'s';
 
 	if ($config{'print_resolved_ip'}) {
-		$host_title = 'Resolved IP';
+		$host_title = 'IP address';
 	} else {
 		$host_title = 'Hostname';
 	}
 
+	$stats_title = $stats_selector[0];
+	if ($sort_selector[0] ne 'None') {
+		$stats_title .= $arrow_placeholder; # leave space for the arrow
+	}
+
 	$line = sprintf($fmt,
 		$host_title, '',
-		$stats_selector[0], '',
-		'Ping history'.($config{'show_scale'} ? ' with scale' : '')
+		$stats_title, '',
+		'Ping history'.($config{'show_scale'} ? ' with scale per '.$config{'scale_ms'}.' ms' : '')
 	);
+
+	if ($sort_selector[0] ne 'None') {
+		# https://ux.stackexchange.com/questions/37564/use-up-or-down-arrow-to-represent-sort-ascending-at-table-header
+		if ($sort_selector[0] eq 'Asc') {
+			$arrow = '▲';
+		} else {
+			$arrow = '▼';
+		}
+		$line =~ s/$arrow_placeholder/$arrow/;
+	}
 
 	attron(A_BOLD);
 	addstr(2, 0, $line);
 	attroff(A_BOLD);
 	
 	$s = "Ping-Multi keys: ".
-		"DNS resolve | Stats | ".
-		"Time scale (per ".$config{'scale_ms'}."ms) | Pause ".
+		"DNS resolve | Stats | Order by | ".
+		"Time scale | Pause ".
 		($config{'pause'} ? 'on ' : 'off')." | Quit";
 	addstr(0, 0, $s);
 	attron(A_BOLD);
-	for $item (qw/ DNS Stats Time Pause Quit /) {
+	for $item (qw/ DNS Stats Time Pause Order Quit /) {
 		$pos = index($s, $item);
 		if ($pos == -1) {
 			die("Unable to find token to make bold: $item");
@@ -630,6 +713,80 @@ sub print_main_headers() {
 		addstr(0, $pos, substr($item, 0, 1));
 	}
 	attroff(A_BOLD);
+}
+
+sub sort_hosts() {
+	my $host;
+	my @sorted_hosts;
+	my $all_samples_ref;
+	my $host_rtt = {};
+	my $pos;
+	my $val;
+	my $dm = 1;
+
+	foreach $host (keys %ping_data) {
+		$all_samples_ref = decode_json($ping_data{$host});
+		(undef, $val, undef) = get_ping_rtt_info($host, $all_samples_ref);
+		$host_rtt->{$host} = $val;
+	}
+
+	@sorted_hosts = sort {
+		# use default init order if no "Order by" is selected
+		if ($sort_selector[0] eq 'None') {
+			return
+				$host_meta->{$a}->{'init_line_pos'}
+				<=>
+				$host_meta->{$b}->{'init_line_pos'}
+			;
+		}
+
+		# undefined hosts are always at the bottom
+		if (!defined($host_rtt->{$a}) && !defined($host_rtt->{$b})) {
+			return
+				$host_meta->{$a}->{'init_line_pos'}
+				<=>
+				$host_meta->{$b}->{'init_line_pos'}
+			;
+		}
+		if (!defined($host_rtt->{$a})) {
+			return +1;
+		}
+		if (!defined($host_rtt->{$b})) {
+			return -1;
+		}
+
+		sub sub_sort {
+			my $a = shift @_;
+			my $b = shift @_;
+			my $host_rtt = shift @_;
+			my $host_meta = shift @_;
+
+			if ($host_rtt->{$a} != $host_rtt->{$b}) {
+				return $host_rtt->{$a} <=> $host_rtt->{$b};
+			} else {
+				# on equal RTT values, fall back to init line position
+				return
+					$host_meta->{$a}->{'init_line_pos'}
+					<=>
+					$host_meta->{$b}->{'init_line_pos'}
+				;
+			}
+		};
+
+		my $res = sub_sort($a, $b, $host_rtt, $host_meta);
+
+		if ($sort_selector[0] eq 'Desc') {
+			return -$res;
+		} else {
+			return $res;
+		}
+	} keys %{$host_meta};
+
+	$pos = $hosts_print_line_offset;
+	foreach $host (@sorted_hosts) {
+		$host_meta->{$host}->{'line_pos'} = $pos;
+		++$pos;
+	}
 }
 
 sub usage() {
@@ -640,7 +797,8 @@ sub usage() {
 		"  -h, --help          display this help and exit\n".
 		"  -S, --sync-ping     send the same amount of ping requests for all hosts\n".
 		"  -W, --wait=SECS     timeout in seconds to wait for a ping reply\n".
-		"  -i, --interval=SECS time in seconds between sending each request\n"
+		"  -i, --interval=SECS time in seconds between sending each request\n".
+		"  -l, --logfile=FILE  log events to file\n"
 	);
 }
 
@@ -657,12 +815,20 @@ sub main() {
 	my $file = '';
 	my $help;
 
+	if ($ENV{'PING_MULTI_NO_ROOT_CHECK'}) { # useful if you have the "cap_net_raw" capability
+		no warnings qw(redefine);
+		*Net::Ping::_isroot = sub {
+			return 1;
+		};
+	}
+
 	GetOptions(
 	    'file|f=s' => \$file,
 	    'help|h' => \$help,
 	    'sync-ping|S' => \$config{'sync_ping'},
 	    'wait|W=f' => \$timeout,
 	    'interval|i=f' => \$ping_interval,
+	    'logfile|l=s' => \$logfile
 	);
 
 	if ($help) {
@@ -671,6 +837,15 @@ sub main() {
 
 	if (scalar @ARGV == 0 && $file eq '') {
 		usage();
+	}
+
+	if ($logfile ne "") {
+		open(LOGFILE, ">>", $logfile) || die("Can't open logfile \"$logfile\": $!\n");
+		# print to file immediately (no buffering)
+		#   https://perl.plover.com/FAQs/Buffering.html
+		my $ofh = select LOGFILE;
+		$| = 1;
+		select $ofh;
 	}
 
 	$config{'scale_ms'} = floor($timeout * 1000 / 10); # 0..9
@@ -691,11 +866,18 @@ sub main() {
 		getch_blocking(); # with a very short timeout
 		handle_pressed_keys();
 
-		term_resize_handle();
+		{
+			lock(%ping_data);
 
-		print_main_headers();
-		print_host_headers();
-		print_ping_data();
+			sort_hosts();
+
+			term_resize_handle();
+
+			print_main_headers();
+			print_host_headers();
+			print_ping_data();
+		}
+
 		trigger_sync_ping();
 
 		if (scalar threads->list(threads::running) != scalar keys %{$host_meta}) {
